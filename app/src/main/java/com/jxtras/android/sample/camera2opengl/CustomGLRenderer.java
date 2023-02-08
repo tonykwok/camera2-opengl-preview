@@ -19,7 +19,7 @@ import android.media.Image;
 import android.media.ImageReader;
 import android.opengl.GLES11Ext;
 import android.opengl.GLES20;
-import android.opengl.GLES31Ext;
+import android.opengl.GLES30;
 import android.opengl.GLSurfaceView;
 import android.opengl.Matrix;
 import android.os.Environment;
@@ -33,6 +33,7 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
@@ -62,7 +63,7 @@ public class CustomGLRenderer implements GLSurfaceView.Renderer, SurfaceTexture.
     private boolean mGLInit = false;
     private boolean mUpdateST = false;
 
-    private CustomGLSurfaceView mView;
+    private final CustomGLSurfaceView mView;
 
     private CameraDevice mCameraDevice;
     private CameraCaptureSession mCaptureSession;
@@ -76,33 +77,48 @@ public class CustomGLRenderer implements GLSurfaceView.Renderer, SurfaceTexture.
     private Handler mBackgroundHandler;
     private Semaphore mCameraOpenCloseLock = new Semaphore(1);
 
+    // {
     private static final int TEXTURE_TYPE_2D = 0;
     private static final int TEXTURE_TYPE_EXT = 1;
+    // only available when using es3
+    private static final int TEXTURE_TYPE_YUV_ITU_601 = 2; // itu_601
+    private static final int TEXTURE_TYPE_YUV_ITU_601_FULL = 3; // itu_601_full_range
+    private static final int TEXTURE_TYPE_YUV_ITU_709 = 4; // itu_709
+    private static final int TEXTURE_TYPE_YUV_TRANSFORM_601 = 5; // custom 601
+    private static final int TEXTURE_TYPE_YUV_TRANSFORM_601_FULL = 6; // custom 601 full
+    private static final int TEXTURE_TYPE_YUV_TRANSFORM_709 = 7; // custom 709
+    private static final int TEXTURE_TYPE_YUV_TRANSFORM_709_FULL = 7; // custom 709
+    // }
+
+    private static final boolean sUseFbo = true;
+    private static final boolean sUseEs3 = true;
+    private static final boolean sUseLut3D = true;
+    private static final boolean sDumpTexture = false;
 
     private int mTextureExternalOes = -1;
-    private boolean mUseFbo = false;
     private int mFrameBufferTextureId = -1;
     private int mFrameBufferId = -1;
+    private int mLut3DTextureId = -1;
 
     CustomGLRenderer (CustomGLSurfaceView view) {
         mView = view;
         float[] vtmp =  {
                 -1.0f, -1.0f, // bottom-left
-                1.0f, -1.0f, // bottom-right
-                -1.0f, 1.0f, // up-left
-                1.0f, 1.0f // up-right
+                 1.0f, -1.0f, // bottom-right
+                -1.0f, 1.0f,  // up-left
+                 1.0f, 1.0f   // up-right
         };
         vertexBuffer = ByteBuffer.allocateDirect(8 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
         vertexBuffer.put(vtmp);
         vertexBuffer.position(0);
 
         float[] ttmp =  {
-                0.0f, 0.0f,
-                1.0f, 0.0f,
-                0.0f, 1.0f,
-                1.0f, 1.0f
+                0.0f, 0.0f, // bottom-left
+                1.0f, 0.0f, // bottom-right
+                0.0f, 1.0f, // up-left
+                1.0f, 1.0f  // up-right
         };
-        texCoords = ByteBuffer.allocateDirect(8*4).order(ByteOrder.nativeOrder()).asFloatBuffer();
+        texCoords = ByteBuffer.allocateDirect(8 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
         texCoords.put(ttmp);
         texCoords.position(0);
     }
@@ -207,81 +223,16 @@ public class CustomGLRenderer implements GLSurfaceView.Renderer, SurfaceTexture.
         mFrameBufferTextureId = textures[0];
         mFrameBufferId = createFrameBuffer(ss.y, ss.x, mFrameBufferTextureId);
 
-        renderProgram = loadRenderShaders("vertexShader.vert", "fragmentShader.frag");
+        if (sUseEs3) {
+            renderProgram = loadRenderShaders("vertexShader3.vert", "fragmentShader3.frag");
+        } else {
+            renderProgram = loadRenderShaders("vertexShader.vert", "fragmentShader.frag");
+        }
 
         cacPreviewSize(ss.x, ss.y);
         openCamera();
 
         mGLInit = true;
-    }
-
-    public static ByteBuffer dumpFrameBuffer(Context context, int x, int y, int w, int h, String fileName) {
-        ByteBuffer buf = ByteBuffer.allocate(w * h * 4);
-        GLES20.glReadPixels(x, y, w, h, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buf);
-        File filePath = new File(context.getExternalFilesDir(Environment.DIRECTORY_PICTURES), fileName);
-        saveBitmap(buf, w, h, Bitmap.Config.ARGB_8888, filePath);
-        buf.rewind();
-        return buf;
-    }
-
-    public static void dumpTexture(Context context, int textureId, boolean isExternal, int x, int y, int w, int h, String fileName) {
-        int[] old_fbo = new int[1];
-        GLES31.glGetIntegerv(GLES31.GL_FRAMEBUFFER_BINDING, old_fbo, 0);
-        Log.d(TAG, "old fbo: " + old_fbo[0]);
-
-        int[] framebuffers = new int[1];
-        GLES31.glGenFramebuffers(1, framebuffers, 0);
-        Log.d(TAG, "new fbo: " + framebuffers[0]);
-
-        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, framebuffers[0]);
-
-        if (isExternal) {
-            GLES31.glFramebufferTexture2D(
-                    GLES31.GL_FRAMEBUFFER,
-                    GLES31.GL_COLOR_ATTACHMENT0,
-                    GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId, 0);
-        } else {
-            GLES31.glFramebufferTexture2D(
-                    GLES31.GL_FRAMEBUFFER,
-                    GLES31.GL_COLOR_ATTACHMENT0,
-                    GLES31.GL_TEXTURE_2D, textureId, 0);
-        }
-
-        ByteBuffer buf = ByteBuffer.allocate(w * h * 4);
-        GLES20.glReadPixels(x, y, w, h, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buf);
-        File filePath = new File(context.getExternalFilesDir(Environment.DIRECTORY_PICTURES), fileName);
-        saveBitmap(buf, w, h, Bitmap.Config.ARGB_8888, filePath);
-
-        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, old_fbo[0]);
-        GLES31.glDeleteFramebuffers(1, framebuffers, 0);
-    }
-
-    public static boolean saveBitmap(Buffer buf, int w, int h, Bitmap.Config config, File path) {
-        boolean succeed = false;
-        if (buf != null) {
-            Bitmap bmp = Bitmap.createBitmap(w, h, config);
-            bmp.copyPixelsFromBuffer(buf);
-
-            FileOutputStream fos = null;
-            try {
-                fos = new FileOutputStream(path);
-                bmp.compress(Bitmap.CompressFormat.JPEG, 100, fos);
-                succeed = true;
-            } catch (FileNotFoundException e) {
-                Log.e(TAG, "saveBitmap failed!", e);
-            } finally {
-                if (fos != null) {
-                    try {
-                        fos.flush();
-                        fos.close();
-                    } catch (Exception ex) {
-                        ex.printStackTrace();
-                    }
-                }
-                bmp.recycle();
-            }
-        }
-        return succeed;
     }
 
     public void onDrawFrame ( GL10 unused ) {
@@ -309,12 +260,12 @@ public class CustomGLRenderer implements GLSurfaceView.Renderer, SurfaceTexture.
 
 //        Matrix.setIdentityM(mTransformMatrix, 0);
 
-        GLES31.glClearColor(1,0,0,0);
+        GLES31.glClearColor(0,0,0,0);
         GLES31.glClear(GLES31.GL_DEPTH_BUFFER_BIT | GLES31.GL_COLOR_BUFFER_BIT);
 
         GLES31.glUseProgram(renderProgram);
 
-        if (mUseFbo) {
+        if (sUseFbo) {
             GLES31.glViewport(0, 0, mPreviewSize.getHeight(), mPreviewSize.getWidth());
             GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, mFrameBufferId);
         }
@@ -346,8 +297,24 @@ public class CustomGLRenderer implements GLSurfaceView.Renderer, SurfaceTexture.
                 GLES31.glGetUniformLocation(renderProgram, "uMVPMatrix"),
                 1, false, mMVPMatrix, 0);
 
-        GLES31.glUniform1i(GLES31.glGetUniformLocation(renderProgram, "uTextureType"), TEXTURE_TYPE_EXT);
-        GLES31.glUniform1i(GLES31.glGetUniformLocation(renderProgram, "sTextureExt"), 1);
+        if (sUseEs3) {
+            if (mLut3DTextureId == -1) {
+                mLut3DTextureId = loadLutTexture("Lucky_64.CUBE");
+            }
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE4);
+            GLES20.glBindTexture(GLES30.GL_TEXTURE_3D, mLut3DTextureId);
+            GLES31.glUniform1i(GLES31.glGetUniformLocation(renderProgram, "sTexture3D"), 4);
+            if (sUseLut3D) {
+                GLES31.glUniform1i(GLES31.glGetUniformLocation(renderProgram, "uEnableLut3D"), 1);
+            } else {
+                GLES31.glUniform1i(GLES31.glGetUniformLocation(renderProgram, "uEnableLut3D"), 0);
+            }
+            GLES31.glUniform1i(GLES31.glGetUniformLocation(renderProgram, "uTextureType"), TEXTURE_TYPE_YUV_TRANSFORM_601_FULL);
+            GLES31.glUniform1i(GLES31.glGetUniformLocation(renderProgram, "sTextureYUV"), 1);
+        } else {
+            GLES31.glUniform1i(GLES31.glGetUniformLocation(renderProgram, "uTextureType"), TEXTURE_TYPE_EXT);
+            GLES31.glUniform1i(GLES31.glGetUniformLocation(renderProgram, "sTextureExt"), 1);
+        }
 
         GLES31.glDrawArrays(GLES31.GL_TRIANGLE_STRIP, 0, 4);
 
@@ -355,18 +322,19 @@ public class CustomGLRenderer implements GLSurfaceView.Renderer, SurfaceTexture.
 
         GLES31.glFinish();
 
-        if (mUseFbo) {
-            dumpFrameBuffer(mView.getContext(),
-                    0, 0, mPreviewSize.getHeight(), mPreviewSize.getWidth(),
-                    "internal.jpg");
-        } else {
+        if (sDumpTexture) {
             dumpTexture(mView.getContext(), mTextureExternalOes, true,
                     0, 0, mPreviewSize.getWidth(), mPreviewSize.getHeight(),
                     "external.jpg");
+            if (sUseFbo) {
+                dumpTexture(mView.getContext(), mFrameBufferTextureId, false,
+                        0, 0, mPreviewSize.getHeight(), mPreviewSize.getWidth(),
+                        "internal.jpg");
+            }
         }
 
-        if (mUseFbo) {
-            GLES31.glViewport(0, 0, 720, 1280);
+        if (sUseFbo) {
+            GLES31.glViewport(0, 0, mView.getWidth(), mView.getHeight());
             GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0);
 
             GLES31.glActiveTexture(GLES31.GL_TEXTURE0);
@@ -483,7 +451,7 @@ public class CustomGLRenderer implements GLSurfaceView.Renderer, SurfaceTexture.
             vertexShaderSrc = strBuilder.toString();
 
         } catch (IOException ex) {
-            System.out.println("Error: " + ex.getMessage());
+            Log.e(TAG, "Error: " + ex.getMessage());
         }
         GLES31.glShaderSource(vertexShader, vertexShaderSrc);
         GLES31.glCompileShader(vertexShader);
@@ -511,14 +479,14 @@ public class CustomGLRenderer implements GLSurfaceView.Renderer, SurfaceTexture.
             fragmentShaderSrc = strBuilder.toString();
 
         } catch (IOException ex) {
-            System.out.println("Error: " + ex.getMessage());
+            Log.e(TAG, "Error: " + ex.getMessage());
         }
 
         GLES31.glShaderSource(fragmentShader, fragmentShaderSrc);
         GLES31.glCompileShader(fragmentShader);
         GLES31.glGetShaderiv(fragmentShader, GLES31.GL_COMPILE_STATUS, compiled, 0);
         if (compiled[0] == 0) {
-            Log.v(TAG, "Could not compile fshader:" + GLES31.glGetShaderInfoLog(fragmentShader));
+            Log.e(TAG, "Could not compile fshader:" + GLES31.glGetShaderInfoLog(fragmentShader));
             GLES31.glDeleteShader(fragmentShader);
             fragmentShader = 0;
         }
@@ -678,6 +646,115 @@ public class CustomGLRenderer implements GLSurfaceView.Renderer, SurfaceTexture.
         } catch (InterruptedException e) {
             Log.e(TAG, "stopBackgroundThread");
         }
+    }
+
+    private static void dumpTexture(Context context, int textureId, boolean isExternal, int x, int y, int w, int h, String fileName) {
+        int[] old_fbo = new int[1];
+        GLES31.glGetIntegerv(GLES31.GL_FRAMEBUFFER_BINDING, old_fbo, 0);
+        Log.d(TAG, "old fbo: " + old_fbo[0]);
+
+        int[] framebuffers = new int[1];
+        GLES31.glGenFramebuffers(1, framebuffers, 0);
+        Log.d(TAG, "new fbo: " + framebuffers[0]);
+
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, framebuffers[0]);
+
+        if (isExternal) {
+            GLES31.glFramebufferTexture2D(
+                    GLES31.GL_FRAMEBUFFER,
+                    GLES31.GL_COLOR_ATTACHMENT0,
+                    GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId, 0);
+        } else {
+            GLES31.glFramebufferTexture2D(
+                    GLES31.GL_FRAMEBUFFER,
+                    GLES31.GL_COLOR_ATTACHMENT0,
+                    GLES31.GL_TEXTURE_2D, textureId, 0);
+        }
+
+        ByteBuffer buf = ByteBuffer.allocate(w * h * 4);
+        GLES20.glReadPixels(x, y, w, h, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buf);
+        File filePath = new File(context.getExternalFilesDir(Environment.DIRECTORY_PICTURES), fileName);
+        saveBitmap(buf, w, h, Bitmap.Config.ARGB_8888, filePath);
+
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, old_fbo[0]);
+        GLES31.glDeleteFramebuffers(1, framebuffers, 0);
+    }
+
+    private static boolean saveBitmap(Buffer buf, int w, int h, Bitmap.Config config, File path) {
+        boolean succeed = false;
+        if (buf != null) {
+            Bitmap bmp = Bitmap.createBitmap(w, h, config);
+            bmp.copyPixelsFromBuffer(buf);
+            try (FileOutputStream fos = new FileOutputStream(path)) {
+                bmp.compress(Bitmap.CompressFormat.JPEG, 100, fos);
+                succeed = true;
+            } catch (IOException e) {
+                Log.e(TAG, "saveBitmap failed!", e);
+            }
+            bmp.recycle();
+        }
+        return succeed;
+    }
+
+    private int loadLutTexture(String lutName) {
+        long startTime = System.currentTimeMillis();
+        ByteBuffer lut3d = null;
+        int lutBlockSize = 0;
+        try (InputStream in = mView.getContext().getAssets().open(lutName);
+             BufferedReader bufferedReader = new BufferedReader(new InputStreamReader(in))) {
+            String line;
+            while ((line = bufferedReader.readLine()) != null) {
+                line = line.trim();
+                if(line.startsWith("#") || line.isEmpty()) {
+                    continue;
+                }
+                String[] parts = line.split("\\s+");
+                if(parts[0].equals("TITLE")) {
+                    Log.d(TAG, "TITLE:" + parts[1]);
+                } else if(parts[0].equals("DOMAIN_MIN")) {
+                    Log.d(TAG, "DOMAIN_MIN:" + parts[1] + "," + parts[2] + "," + parts[3]);
+                } else if(parts[0].equals("DOMAIN_MAX")) {
+                    Log.d(TAG, "DOMAIN_MAX:" + parts[1] + "," + parts[2] + "," + parts[3]);
+                } else if(parts[0].equals("LUT_1D_SIZE")) {
+                    Log.d(TAG, "LUT_1D_SIZE:" + Integer.parseInt(parts[1]));
+                } else if(parts[0].equals("LUT_3D_SIZE")) {
+                    lutBlockSize = Integer.parseInt(parts[1]);
+                    Log.d(TAG, "LUT_3D_SIZE:" + lutBlockSize);
+                    lut3d = ByteBuffer.allocateDirect(lutBlockSize * lutBlockSize * lutBlockSize * 3);
+                } else if (lut3d != null) {
+                    int r = Math.min(Math.max(0, (int) (Float.parseFloat(parts[0]) * 255)), 255);
+                    int g = Math.min(Math.max(0, (int) (Float.parseFloat(parts[1]) * 255)), 255);
+                    int b = Math.min(Math.max(0, (int) (Float.parseFloat(parts[2]) * 255)), 255);
+//                    Log.e(TAG, "loadLutTexture: " + r + "," + g + "," + b);
+                    lut3d.put((byte) (r  & 0xFF));
+                    lut3d.put((byte) (g  & 0xFF));
+                    lut3d.put((byte) (b  & 0xFF));
+                }
+            }
+            Log.d(TAG, "loadLutTexture success! cost:" + (System.currentTimeMillis() - startTime));
+        } catch (IOException e) {
+            Log.e(TAG, "loadLutTexture fail, error:" + e.getCause());
+        }
+        if (lut3d == null || lut3d.limit() != lutBlockSize * lutBlockSize * lutBlockSize * 3) {
+            throw new IllegalStateException("failed to create lut3d");
+        }
+        lut3d.position(0);
+        GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT, 1);
+        int[] textures = new int[1];
+        GLES31.glGenTextures(1, textures, 0);
+        int texture =textures[0];
+        GLES20.glBindTexture(GLES30.GL_TEXTURE_3D, texture);
+        GLES20.glTexParameterf(GLES30.GL_TEXTURE_3D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE);
+        GLES20.glTexParameterf(GLES30.GL_TEXTURE_3D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE);
+        GLES20.glTexParameterf(GLES30.GL_TEXTURE_3D, GLES30.GL_TEXTURE_WRAP_R, GLES20.GL_CLAMP_TO_EDGE);
+        GLES20.glTexParameteri(GLES30.GL_TEXTURE_3D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR);
+        GLES20.glTexParameteri(GLES30.GL_TEXTURE_3D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR);
+        GLES30.glTexImage3D(GLES30.GL_TEXTURE_3D, 0, GLES30.GL_RGB8,
+                lutBlockSize, lutBlockSize, lutBlockSize,
+                0, GLES20.GL_RGB, GLES20.GL_UNSIGNED_BYTE, lut3d);
+        checkGlError("glTexImage3D");
+        GLES20.glBindTexture(GLES30.GL_TEXTURE_3D, 0);
+        return texture;
     }
 
     static String arrayString(float[] array) {
